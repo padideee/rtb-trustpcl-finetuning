@@ -14,9 +14,6 @@ from tqdm import trange
 
 WANDB = True
 
-if WANDB:
-    import wandb
-
 parser = argparse.ArgumentParser(description='finetuning posterior')
 parser.add_argument('--lr_policy', type=float, default=1e-3)
 parser.add_argument('--batch_size', type=int, default=500)
@@ -24,9 +21,14 @@ parser.add_argument('--epochs', type=int, default=5000)
 parser.add_argument('--seed', type=int, default=12345)
 parser.add_argument('--kl_weight', type=float, default=1.)
 parser.add_argument('--name', type=str, default='rtb_finetuning')
-parser.add_argument('--method', type=str, default='rtb')
+parser.add_argument('--method', type=str, default='rtb')  # rtb, rl, rl_corrected, rl_corrected_offpolicy
 
 args = parser.parse_args()
+
+if WANDB:
+    import wandb
+
+    wandb.init(project='gflownet', entity='panou', name=args.method, config=vars(args))
 
 set_seed(args.seed)
 if 'SLURM_PROCID' in os.environ:
@@ -38,7 +40,8 @@ plot_data_size = 2000
 
 args.zero_init = True
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
+print(f'Using device: {device}')
 
 def get_energy():
     prior = TwentyFiveGaussianMixture(device=device)
@@ -46,7 +49,7 @@ def get_energy():
     return energy, prior
 
 
-def plot_step(energy, gfn_model, name):
+def plot_step(energy, gfn_model, name, method='rtb'):
 
 
     batch_size = plot_data_size
@@ -63,9 +66,10 @@ def plot_step(energy, gfn_model, name):
     plot_samples(samples, ax=ax_contour, bounds=(-13., 13.))
     plot_samples(samples, ax=ax_kde_overlay, bounds=(-13., 13.))
 
-    fig_contour.savefig(f'output/{name}_contour.png', bbox_inches='tight')
-    fig_kde_overlay.savefig(f'output/{name}_kde_overlay.png', bbox_inches='tight')
-    fig_kde.savefig(f'output/{name}_kde.png', bbox_inches='tight')
+    os.makedirs('output', exist_ok=True)
+    fig_contour.savefig(f'output/{name}_{method}_contour.png', bbox_inches='tight')
+    fig_kde_overlay.savefig(f'output/{name}_{method}_kde_overlay.png', bbox_inches='tight')
+    fig_kde.savefig(f'output/{name}_{method}_kde.png', bbox_inches='tight')
     try:
         return {"visualization/contour": wandb.Image(fig_to_image(fig_contour)),
                 "visualization/kde_overlay": wandb.Image(fig_to_image(fig_kde_overlay)),
@@ -91,14 +95,34 @@ def train_step(energy, prior, gfn_model, gfn_optimizer, it, method, exploratory,
         loss.backward()
         gfn_optimizer.step()
         return loss.item(), rl_loss.mean().item(), kl_loss.mean().item(), kl_div.item()
+    elif method == 'rl_corrected':
+        exploration_std = get_exploration_std(it, False, 0.0, False)
+
+        reinforce_kl_loss, kl_div = fwd_train_step(energy, prior, gfn_model, exploration_std, method)
+        reinforce_kl_loss.backward()
+        gfn_optimizer.step()
+        return reinforce_kl_loss.item(), kl_div.item()
+    elif method == 'rl_corrected_offpolicy':
+        exploration_std = get_exploration_std(it, True, 0.5, True)
+
+        reinforce_kl_loss, kl_div = fwd_train_step(energy, prior, gfn_model, exploration_std, method)
+        reinforce_kl_loss.backward()
+        gfn_optimizer.step()
+        return reinforce_kl_loss.item(), kl_div.item()
 
 def fwd_train_step(energy, prior, gfn_model, exploration_std, method, return_exp=False, beta=1.0):
     init_state = torch.zeros(args.batch_size, energy.data_ndim).to(device)
     
     if method == 'rtb':
         return get_finetuning_loss('rtb', init_state, prior, gfn_model, energy.log_reward, beta = beta, exploration_std=exploration_std, return_exp=return_exp)
-    else:
+    elif method == 'rl':
         return get_finetuning_loss('rl', init_state, prior, gfn_model, energy.log_reward, beta = beta, exploration_std=exploration_std, return_exp=return_exp)
+    elif method == 'rl_corrected':
+        return get_finetuning_loss('rl_corrected', init_state, prior, gfn_model, energy.log_reward, beta=beta,
+                               exploration_std=exploration_std, return_exp=return_exp)
+    elif method == 'rl_corrected_offpolicy':
+        return get_finetuning_loss('rl_corrected_offpolicy', init_state, prior, gfn_model, energy.log_reward, beta=beta,
+                               exploration_std=exploration_std, return_exp=return_exp)
 
 
 
@@ -127,7 +151,7 @@ def train():
 
     checkpoint_path = 'pretrained/prior.pt'
 
-    checkpoint = torch.load(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
     
     if 'model_state_dict' in checkpoint:
         gfn_model.load_state_dict(checkpoint['model_state_dict'])
@@ -152,7 +176,7 @@ def train():
             
             metrics['train/loss'] = loss
             metrics['train/kl_div'] = kl_div
-        else:
+        elif method == 'rl':
             # on-policy: no exploratinon noise (False)
             loss, rl_loss, kl_loss, kl_div = train_step(energy, prior, gfn_model, gfn_optimizer, i, method, False, 0.0, False, beta=1.0, kl_weight=args.kl_weight)
     
@@ -160,16 +184,30 @@ def train():
             metrics['train/rl_loss'] = rl_loss
             metrics['train/kl_loss'] = kl_loss
             metrics['train/kl_div'] = kl_div
+        elif method == 'rl_corrected':
+            # on-policy: no exploration noise (False)
+            reinforce_kl_loss, kl_div = train_step(energy, prior, gfn_model, gfn_optimizer, i, method, False, 0.0,
+                                                   False, beta=1.0)
+
+            metrics['train/loss'] = reinforce_kl_loss
+            metrics['train/kl_div'] = kl_div
+        elif method == 'rl_corrected_offpolicy':
+            reinforce_kl_loss, kl_div = train_step(energy, prior, gfn_model, gfn_optimizer, i, method, True, 0.5, True,
+                                                   beta=1.0)
+
+            metrics['train/loss'] = reinforce_kl_loss
+            metrics['train/kl_div'] = kl_div
         
         if i % 100 == 0:
 
-            images = plot_step(energy, gfn_model, name)
+            images = plot_step(energy, gfn_model, name, method=method)
             metrics.update(images)
             plt.close('all')
 
             # you may put logger here
             #########################
-            # wandb.log(metrics)
+            if WANDB:
+                wandb.log(metrics)
             
 
             #########################
@@ -180,9 +218,9 @@ def train():
                     'epoch': i,
                     'model_state_dict': gfn_model.state_dict(),
                     'optimizer_state_dict': gfn_optimizer.state_dict(),
-                }, f'output/{name}.pt')
+                }, f'output/{name}_{method}.pt')
 
-    images = plot_step(energy, gfn_model, name)
+    images = plot_step(energy, gfn_model, name, method=method)
     metrics.update(images)
     plt.close('all')
 
@@ -190,7 +228,7 @@ def train():
         'epoch': args.epochs,
         'model_state_dict': gfn_model.state_dict(),
         'optimizer_state_dict': gfn_optimizer.state_dict(),
-    }, f'output/{name}.pt')
+    }, f'output/{name}_{method}.pt')
         
 
 

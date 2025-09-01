@@ -127,13 +127,15 @@ class GFN(nn.Module):
             s_new = torch.clip(s_new, -self.gfn_clip, self.gfn_clip)
         return s_new, flow.squeeze(-1)
 
-    def get_trajectory_fwd(self, s, exploration_std, log_r, pis=False):
+    def get_trajectory_fwd(self, s, exploration_std, log_r, pis=False, return_behavior_logpf: bool = False):
         bsz = s.shape[0]
 
         logpf = torch.zeros((bsz, self.trajectory_length), device=self.device)
         logpb = torch.zeros((bsz, self.trajectory_length), device=self.device)
         logf = torch.zeros((bsz, self.trajectory_length + 1), device=self.device)
         states = torch.zeros((bsz, self.trajectory_length + 1, self.dim), device=self.device)
+        if return_behavior_logpf:
+            logpf_behavior = torch.zeros((bsz, self.trajectory_length), device=self.device)
 
         for i in range(self.trajectory_length):
             pfs, flow = self.predict_next_state(s, i * self.dt, log_r)
@@ -171,6 +173,12 @@ class GFN(nn.Module):
             noise = ((s_ - s) - self.dt * pf_mean) / (np.sqrt(self.dt) * (pflogvars / 2).exp())
             logpf[:, i] = -0.5 * (noise ** 2 + logtwopi + np.log(self.dt) + pflogvars).sum(1)
 
+            if return_behavior_logpf:
+                mean_used = pf_mean if pis else pf_mean.detach()
+                var_used = pflogvars_sample
+                noise_b = ((s_ - s) - self.dt * mean_used) / (np.sqrt(self.dt) * (var_used / 2).exp())
+                logpf_behavior[:, i] = -0.5 * (noise_b ** 2 + logtwopi + np.log(self.dt) + var_used).sum(1)
+
             if self.learn_pb:
                 t = self.t_model((i + 1) * self.dt).repeat(bsz, 1)
                 pbs = self.back_model(self.s_model(s_), t)
@@ -189,6 +197,8 @@ class GFN(nn.Module):
             s = s_
             states[:, i + 1] = s
 
+        if return_behavior_logpf:
+            return states, logpf, logpb, logf, logpf_behavior
         return states, logpf, logpb, logf
 
 

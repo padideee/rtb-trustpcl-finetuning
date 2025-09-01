@@ -62,8 +62,16 @@ def get_gfn_optimizer(gfn_model, lr_policy, lr_flow, lr_back, back_model=False, 
 
 def get_finetuning_loss(mode, init_state, prior, gfn_model, log_reward, beta = 1.0, exploration_std=None, return_exp=False):
     if mode == 'rl':
-        rl_loss, kl_loss, kl_div = fwd_rl(init_state, prior, gfn_model, log_reward, exploration_std)
+        rl_loss, kl_loss, kl_div = fwd_rl(init_state, prior, gfn_model, log_reward, exploration_std, beta=beta)
         return rl_loss, kl_loss, kl_div
+    elif mode == 'rl_corrected':
+        reinforce_kl_loss, kl_div = fwd_rl_corrected(init_state, prior, gfn_model, log_reward, exploration_std,
+                                                     beta=beta)
+        return reinforce_kl_loss, kl_div
+    elif mode == 'rl_corrected_offpolicy':
+        reinforce_kl_loss, kl_div = fwd_rl_corrected_off_policy(init_state, prior, gfn_model, log_reward,
+                                                                exploration_std, beta=beta)
+        return reinforce_kl_loss, kl_div
     elif mode == 'rtb':
         return fwd_rtb(init_state, prior, gfn_model, log_reward, exploration_std, beta = beta, return_exp=return_exp)
 
