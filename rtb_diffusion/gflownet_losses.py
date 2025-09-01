@@ -29,13 +29,11 @@ def fwd_rl_corrected(initial_state, prior, gfn, log_reward_fn, exploration_std=N
 
     with torch.no_grad():
         log_r = log_reward_fn(states[:, -1]).detach()
-        reward = log_r.exp()
 
-    with torch.no_grad():
-        w = reward - (1.0 / beta) * (logq - logp)
-        w = w - w.mean()
+        adv = log_r - (1.0 / beta) * (logq - logp)
+        adv = adv - adv.mean()
 
-    reinforce_kl_loss = - (w * logq).mean()
+    reinforce_kl_loss = - (adv * logq).mean()
 
     kl_div = (logq - logp).mean()
 
@@ -55,15 +53,13 @@ def fwd_rl_corrected_off_policy(initial_state, prior, gfn, log_reward_fn, explor
 
     with torch.no_grad():
         log_r = log_reward_fn(states[:, -1]).detach()
-        reward = log_r.exp()
 
-    with torch.no_grad():
-        w = reward - (1.0 / beta) * (logq - logp)
-        w = w - w.mean()
+        adv = log_r - (1.0 / beta) * (logq - logp)
+        adv = adv - adv.mean()
 
     is_ratio = torch.softmax((logq - logq_b) / log_p_posterior.shape[1], dim=-1).detach()
 
-    reinforce_kl_loss = - (is_ratio * w * logq).sum()
+    reinforce_kl_loss = - (is_ratio * adv * logq).sum()
 
     kl_div = (is_ratio * (logq - logp)).sum()
 
